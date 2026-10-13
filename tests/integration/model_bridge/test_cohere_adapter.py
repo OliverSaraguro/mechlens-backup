@@ -6,11 +6,10 @@ Model: trl-internal-testing/tiny-CohereForCausalLM
   - logit_scale=0.125 (canonical Command-R is 0.0625; tiny diverges so
     regression tests catch silent-fallback bugs in the passthrough)
 
-NOTE: The tiny model has use_qk_norm=False, so QK-norm is not exercised here.
-Cohere's QK-norm is a per-head LayerNorm inside CohereAttention.forward; it is
-handled via HF delegation (PositionEmbeddingsAttentionBridge calls the original
-CohereAttention.forward directly), so functional correctness for that path relies
-on the same delegation mechanism verified in test_forward_matches_hf.
+The tiny checkpoint has use_qk_norm=False; this file does not certify enabled
+QK normalization or a production Command-R checkpoint. Raw and processed paths
+are compared independently with an unwrapped HF model. Centering is disabled
+because it intentionally changes raw logits and residual coordinates.
 """
 
 from typing import Any
@@ -26,12 +25,118 @@ from transformer_lens.model_bridge.generalized_components.position_embeddings_at
 )
 
 MODEL = "trl-internal-testing/tiny-CohereForCausalLM"
+pytestmark = pytest.mark.slow
+LOGIT_ATOL = 1e-4
+# Secondary checks use a stricter absolute budget; no relative-error allowance.
+ACTIVATION_ATOL = 1e-5
+PROMPTS = (
+    "The capital of France is",
+    " ".join(
+        f"Record {i}: the blue box contains {i + 3} marbles; the red box contains {2 * i + 1}."
+        for i in range(16)
+    )
+    + " Which record has the most marbles in its red box? Explain the comparison.",
+)
+
+
+def _boot_cohere() -> TransformerBridge:
+    bridge = TransformerBridge.boot_transformers(MODEL, device="cpu", dtype=torch.float32)
+    bridge.eval()
+    bridge.original_model.eval()
+    return bridge
+
+
+def _process_for_parity(bridge: TransformerBridge, *, fold_ln: bool) -> None:
+    bridge.enable_compatibility_mode(
+        disable_warnings=True,
+        fold_ln=fold_ln,
+        center_writing_weights=False,
+        center_unembed=False,
+        fold_value_biases=False,
+        refactor_factored_attn_matrices=False,
+    )
+
+
+def _assert_close(actual: torch.Tensor, expected: torch.Tensor, *, name: str, atol: float) -> None:
+    assert actual.shape == expected.shape, f"{name}: {actual.shape} != {expected.shape}"
+    assert actual.dtype == expected.dtype == torch.float32, f"{name}: expected float32"
+    assert torch.isfinite(actual).all(), f"{name}: nonfinite bridge values"
+    assert torch.isfinite(expected).all(), f"{name}: nonfinite HF values"
+    max_diff = (actual - expected).abs().max().item()
+    assert max_diff <= atol, f"{name}: max absolute delta {max_diff:.8g} exceeds {atol:.1g}"
+
+
+def _reference_forward(hf_model: Any, tokens: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    activations = {}
+
+    def capture(name: str):
+        def hook(module: Any, args: tuple, kwargs: dict) -> None:
+            hidden = args[0] if args else kwargs["hidden_states"]
+            activations[name] = hidden.detach().clone()
+
+        return hook
+
+    handles = [
+        hf_model.model.layers[0].register_forward_pre_hook(capture("resid_pre"), with_kwargs=True),
+        hf_model.model.norm.register_forward_pre_hook(capture("final_resid"), with_kwargs=True),
+    ]
+    try:
+        with torch.no_grad():
+            output = hf_model(tokens, use_cache=False, output_attentions=True)
+        assert output.attentions is not None, "HF eager attention patterns were not returned"
+        activations["pattern"] = output.attentions[0].detach().clone()
+        assert set(activations) == {"resid_pre", "pattern", "final_resid"}
+        return output.logits.detach().clone(), activations
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _assert_forward_parity(bridge: TransformerBridge, hf_model: Any, tokens: torch.Tensor) -> None:
+    expected_logits, expected = _reference_forward(hf_model, tokens)
+    # Final residual is before final normalization, not HF's final normalized hidden state.
+    hook_names = {
+        "resid_pre": "blocks.0.hook_in",
+        "pattern": "blocks.0.attn.hook_pattern",
+        "final_resid": "ln_final.hook_in",
+    }
+    with torch.no_grad():
+        actual_logits, cache = bridge.run_with_cache(
+            tokens,
+            names_filter=list(hook_names.values()),
+            return_cache_object=False,
+            use_cache=False,
+        )
+    for name, hook_name in hook_names.items():
+        assert hook_name in cache, f"Missing activation: {hook_name}"
+        _assert_close(cache[hook_name], expected[name], name=name, atol=ACTIVATION_ATOL)
+    _assert_close(actual_logits, expected_logits, name="logits", atol=LOGIT_ATOL)
+
+
+@pytest.fixture(scope="module", params=["short", "long"])
+def parity_tokens(request, cohere_bridge: TransformerBridge) -> torch.Tensor:
+    prompt = PROMPTS[0 if request.param == "short" else 1]
+    tokenizer = cohere_bridge.tokenizer
+    assert tokenizer is not None
+    tokens = tokenizer(prompt, return_tensors="pt", truncation=False)["input_ids"]
+    assert tokens.shape[1] <= cohere_bridge.cfg.n_ctx, "Parity prompt exceeds context window"
+    if request.param == "long":
+        assert tokens.shape[1] >= 128, "Long regression prompt must exercise at least 128 tokens"
+    return tokens
+
+
+@pytest.fixture(scope="module", params=["raw", "scale_fold", "layernorm_fold"])
+def parity_bridge(request):
+    bridge = _boot_cohere()
+    if request.param != "raw":
+        _process_for_parity(bridge, fold_ln=request.param == "layernorm_fold")
+    return bridge
 
 
 @pytest.fixture(scope="module")
 def cohere_bridge():
     """Load tiny Cohere bridge once per module (no weight processing)."""
-    return TransformerBridge.boot_transformers(MODEL, device="cpu")
+    return _boot_cohere()
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +147,7 @@ def cohere_bridge_processed():
     it automatically. We disable all ProcessWeights options so only the adapter's
     preprocess_weights (logit_scale fold + untie) runs.
     """
-    bridge = TransformerBridge.boot_transformers(MODEL, device="cpu")
+    bridge = _boot_cohere()
     bridge.process_weights(
         fold_ln=False,
         center_writing_weights=False,
@@ -56,7 +161,9 @@ def cohere_bridge_processed():
 @pytest.fixture(scope="module")
 def cohere_hf() -> Any:
     """Load the raw HF model for side-by-side comparisons."""
-    return AutoModelForCausalLM.from_pretrained(MODEL).eval()
+    return AutoModelForCausalLM.from_pretrained(
+        MODEL, dtype=torch.float32, attn_implementation="eager"
+    ).eval()
 
 
 # ---------------------------------------------------------------------------
@@ -152,14 +259,35 @@ class TestCohereForwardEquivalence:
         assert not torch.isnan(output).any()
         assert not torch.isinf(output).any()
 
-    def test_forward_matches_hf(self, cohere_bridge: TransformerBridge, cohere_hf: Any) -> None:
-        """Bridge delegates to HF native forward — logits should be identical."""
-        tokens = torch.tensor([[1, 2, 3, 4]])
-        with torch.no_grad():
-            bridge_out = cohere_bridge(tokens)
-            hf_out = cohere_hf(tokens).logits
-        max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 1e-4, f"Bridge vs HF max diff = {max_diff:.6f}"
+    def test_forward_matches_hf(
+        self, parity_bridge: TransformerBridge, cohere_hf: Any, parity_tokens: torch.Tensor
+    ) -> None:
+        """Compare logits and three activation checkpoints on short and long inputs."""
+        _assert_forward_parity(parity_bridge, cohere_hf, parity_tokens)
+
+    @pytest.mark.parametrize("fault", ["missing_scale", "fallback_scale", "double_scale"])
+    def test_parity_rejects_bad_logit_scale(
+        self, cohere_hf: Any, parity_tokens: torch.Tensor, fault: str
+    ) -> None:
+        """Require a passing control before checking deliberately incorrect conversion scales."""
+        correct = _boot_cohere()
+        _process_for_parity(correct, fold_ln=False)
+        _assert_forward_parity(correct, cohere_hf, parity_tokens)
+        del correct
+
+        broken = _boot_cohere()
+        scale = float(getattr(broken.cfg, "logit_scale"))
+        wrong_scale = {
+            "missing_scale": 1.0,
+            "fallback_scale": 0.0625,
+            "double_scale": scale * scale,
+        }[fault]
+        assert wrong_scale != scale
+        setattr(broken.cfg, "logit_scale", wrong_scale)
+        _process_for_parity(broken, fold_ln=False)
+        # Only the numerical logit assertion qualifies; load/hook errors cannot pass this test.
+        with pytest.raises(AssertionError, match="logits: max absolute delta"):
+            _assert_forward_parity(broken, cohere_hf, parity_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +332,7 @@ class TestCohereLogitScaleEndToEnd:
         with torch.no_grad():
             bridge_out = cohere_bridge(tokens)
             hf_out = cohere_hf(tokens).logits
-        # If logit_scale were applied twice, outputs would differ by a factor of 16
+        # An extra scale multiply changes logits by the checkpoint scale (0.125).
         max_diff = (bridge_out - hf_out).abs().max().item()
         assert max_diff < 1e-4, f"Possible double-application of logit_scale; diff={max_diff:.6f}"
 
@@ -241,8 +369,8 @@ class TestCohereTiedEmbedding:
         #
         # cfg.logit_scale is set before process_weights so the fold (which reads it
         # inside preprocess_weights) runs with the parametrized value.
-        bridge = TransformerBridge.boot_transformers(MODEL, device="cpu")
-        bridge.cfg.logit_scale = logit_scale  # type: ignore[attr-defined]
+        bridge = _boot_cohere()
+        setattr(bridge.cfg, "logit_scale", logit_scale)
         bridge.process_weights(
             fold_ln=False,
             center_writing_weights=False,
